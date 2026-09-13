@@ -210,6 +210,7 @@ class AuditRecord:
     code: str
     argument_keys: tuple[str, ...]
     latency_ms: int | None = None
+    redacted_arguments: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -337,6 +338,11 @@ def _redact(value: Any) -> Any:
         value = re.sub(r"(ACC-[A-Z]-)\d{2}(\d{4})", r"\1****\2", value)
         return value
     return value
+
+
+def _redact_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """对参数字典进行脱敏处理，用于审计日志记录。"""
+    return _redact(dict(arguments))
 
 
 class PermissionEngine:
@@ -516,6 +522,7 @@ class ToolRuntime:
                 decision=decision.action,
                 code=decision.code,
                 argument_keys=tuple(sorted(call.arguments)),
+                redacted_arguments=_redact_arguments(call.arguments),
             )
         )
         if decision.action is not DecisionAction.ALLOW:
@@ -554,6 +561,7 @@ class ToolRuntime:
                 code="OK",
                 argument_keys=tuple(sorted(call.arguments)),
                 latency_ms=latency_ms,
+                redacted_arguments=_redact_arguments(call.arguments),
             )
         )
         return ToolResult(call.tool_call_id, call.name, True, DecisionAction.ALLOW, "OK", safe_content)
