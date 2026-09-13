@@ -1,0 +1,46 @@
+# --- Python 核心忽略项 ---
+# 字节码缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境 (venv, venv.bak, env 等)
+venv/
+.env/
+ENV/
+.venv/
+
+# 分发与构建
+dist/
+build/
+*.egg-info/
+*.egg
+
+# --- 测试与工具缓存 ---
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# --- IDE 配置文件 ---
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+
+# --- 操作系统文件 ---
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# --- 敏感信息 (建议) ---
+# 如果你后续创建了包含 API Key 或密码的文件，请在这里添加
+# .env
+# secrets.json
+AI Agent 全栈工程师训练营-作业二.md
