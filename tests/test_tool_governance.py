@@ -1,334 +1,244 @@
-"""四、必须通过的 5 个转账测试"""
+"""第二章作业验收：转账工具（transfer）的 5 个链路测试。
+
+约法三章（作业"不能改动的地方"）：
+- 所有调用都经过 `ToolRuntime.invoke`，不直接调 handler。
+- 不改 `PermissionEngine.decide` 的优先级顺序，测试只观察它的输出。
+
+未完成对应任务时，测试给的是"哪一步没做"的失败信息，而不是导入错误：
+缺少 `ACCOUNTS` 会命中 `accounts()` 的断言，没注册 transfer 工具会拿到 `TOOL_NOT_FOUND`。
+"""
+
+from __future__ import annotations
 
 import asyncio
-import json
+import functools
+import time
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from typing import Any
+
 import pytest
 
-from tool_governance_demo import (
-    ApprovalStore,
-    ArgsModel,
-    AuditSink,
-    Effect,
-    ExecutionContext,
-    PermissionEngine,
-    PolicyDenied,
-    Risk,
-    SIDE_EFFECTS,
-    ToolCall,
-    ToolDefinition,
-    ToolPolicy,
-    ToolRuntime,
-    TransferArgs,
-    base_context,
-    build_runtime,
-    build_tools,
-    reset_side_effects,
-    transfer_handler,
-)
+import tool_governance_demo as demo
+
+TRANSFER = "transfer"
+APPROVAL_ID = "approval_transfer"
+FROM_ACCOUNT = "ACC-A-123456"  # tenant_a，余额 100000.0
+TO_ACCOUNT = "ACC-A-654321"  # tenant_a，余额 5000.0
+SMALL_ACCOUNT = "ACC-A-888888"  # tenant_a，余额 20000.0
+SLEEP_SECONDS = 3.0  # transfer_handler 里刻意制造的慢调用
+
+
+def async_test(test: Callable[..., Awaitable[None]]) -> Callable[..., None]:
+    """不依赖 pytest-asyncio，让 async 测试在任何 pytest 环境下都能跑。"""
+
+    @functools.wraps(test)
+    def run(*args: Any, **kwargs: Any) -> None:
+        asyncio.run(test(*args, **kwargs))
+
+    return run
+
+
+def transfer_context(**overrides: Any) -> demo.ExecutionContext:
+    """带 transfer:execute 权限和 transfer 执行白名单的上下文。"""
+
+    defaults: dict[str, Any] = {
+        "permissions": frozenset({"order:read", "refund:create", "shell:run", "transfer:execute"}),
+        "allowed_tools": frozenset({"get_order", "create_refund", "run_shell", "transfer"}),
+    }
+    return demo.base_context(**{**defaults, **overrides})
+
+
+def accounts() -> dict[tuple[str, str], float]:
+    store = getattr(demo, "ACCOUNTS", None)
+    assert isinstance(store, dict), "任务 1 未完成：tool_governance_demo.ACCOUNTS 不存在"
+    return store
+
+
+def balance(account: str, tenant_id: str = "tenant_a") -> float:
+    store = accounts()
+    assert (tenant_id, account) in store, f"任务 1 未完成：ACCOUNTS 缺少 {(tenant_id, account)}"
+    return store[(tenant_id, account)]
+
+
+def approve(approvals: demo.ApprovalStore, arguments: Mapping[str, Any]) -> None:
+    """对同一份参数做一次性审批（摘要绑定，值必须与调用时逐字节一致）。"""
+
+    approvals.approve(APPROVAL_ID, transfer_context(), TRANSFER, dict(arguments))
+
+
+async def transfer(
+    runtime: demo.ToolRuntime,
+    tool_call_id: str,
+    arguments: Mapping[str, Any],
+    **context_overrides: Any,
+) -> demo.ToolResult:
+    return await runtime.invoke(
+        demo.ToolCall(tool_call_id, TRANSFER, arguments),
+        transfer_context(**context_overrides),
+    )
 
 
 @pytest.fixture(autouse=True)
-def _reset():
-    """每个测试前重置副作用计数。"""
-    reset_side_effects()
+def isolated_accounts() -> Iterator[None]:
+    """ACCOUNTS 是模块级可变状态，逐个用例还原，保证互相隔离且可重复运行。"""
+
+    store = getattr(demo, "ACCOUNTS", None)
+    snapshot = dict(store) if isinstance(store, dict) else None
+    demo.reset_side_effects()
     yield
+    if snapshot is not None:
+        store.clear()
+        store.update(snapshot)
 
 
-def _transfer_context(**overrides):
-    """构造包含 transfer 权限与白名单的上下文。"""
-    ctx = base_context(
-        permissions=frozenset(
-            {"order:read", "refund:create", "shell:run", "transfer:execute"}
-        ),
-        allowed_tools=frozenset(
-            {"get_order", "create_refund", "run_shell", "transfer"}
-        ),
+@async_test
+async def test_transfer_rejects_injected_arguments_and_invalid_amount() -> None:
+    """参数校验：extra="forbid" 挡住模型注入，Field 约束挡住非法账号与额度。"""
+
+    runtime, _approvals, _audit = demo.build_runtime()
+    valid = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 100.0}
+
+    injected = await transfer(runtime, "call_tr_inject", {**valid, "approved": True, "user_id": "u_admin"})
+    assert injected.ok is False
+    assert injected.code == "INVALID_ARGUMENT"
+
+    malformed = await transfer(runtime, "call_tr_format", {**valid, "from_account": "ACC-123456"})
+    assert malformed.code == "INVALID_ARGUMENT"
+
+    zero = await transfer(runtime, "call_tr_zero", {**valid, "amount": 0.0})
+    assert zero.code == "INVALID_ARGUMENT"
+
+    over_schema = await transfer(runtime, "call_tr_schema", {**valid, "amount": 100_000.1})
+    assert over_schema.code == "INVALID_ARGUMENT"
+
+    assert balance(FROM_ACCOUNT) == 100_000.0
+
+
+@async_test
+async def test_transfer_precheck_blocks_over_limit_and_insufficient_balance() -> None:
+    """业务预检：单笔限额与余额充足都是 handler 之前的确定性拒绝。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+
+    over_limit = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 60_000.0}
+    approve(approvals, over_limit)
+    rejected = await transfer(runtime, "call_tr_limit", over_limit, approval_id=APPROVAL_ID)
+    assert rejected.ok is False
+    assert rejected.action is demo.DecisionAction.DENY
+    assert rejected.code == "EXCEED_LIMIT"
+
+    short = {"from_account": SMALL_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 30_000.0}
+    approve(approvals, short)
+    rejected = await transfer(runtime, "call_tr_balance", short, approval_id=APPROVAL_ID)
+    assert rejected.action is demo.DecisionAction.DENY
+    assert rejected.code == "INSUFFICIENT_BALANCE"
+
+    assert balance(FROM_ACCOUNT) == 100_000.0
+    assert balance(SMALL_ACCOUNT) == 20_000.0
+    assert balance(TO_ACCOUNT) == 5_000.0
+
+
+@async_test
+async def test_transfer_is_denied_without_permission_or_whitelist_and_in_plan_mode() -> None:
+    """权限判断：带上审批也越不过 RBAC、执行白名单和 plan 只读契约。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+    arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 1_000.0}
+    approve(approvals, arguments)
+    approved: dict[str, Any] = {"approval_id": APPROVAL_ID}
+
+    no_permission = await transfer(
+        runtime,
+        "call_tr_rbac",
+        arguments,
+        permissions=frozenset({"order:read", "refund:create", "shell:run"}),
+        **approved,
     )
-    from dataclasses import replace
+    assert no_permission.action is demo.DecisionAction.DENY
+    assert no_permission.code == "PERMISSION_DENIED"
 
-    return replace(ctx, **overrides)
-
-
-# ─────────────────────────────────────────────
-# 审计日志打印辅助函数
-# ─────────────────────────────────────────────
-def print_audit_logs(audit, label=""):
-    """打印审计日志，验证账号脱敏和审批状态。"""
-    print(f"\n{'='*60}")
-    print(f"审计日志 {label}")
-    print(f"{'='*60}")
-    for i, record in enumerate(audit.records, 1):
-        print(f"\n记录 {i}:")
-        print(f"  Phase: {record.phase}")
-        print(f"  Decision: {record.decision}")
-        print(f"  Code: {record.code}")
-        print(f"  Argument keys: {record.argument_keys}")
-        if record.redacted_arguments:
-            print(f"  Redacted arguments: {json.dumps(record.redacted_arguments, ensure_ascii=False)}")
-    print(f"{'='*60}\n")
-
-
-# ─────────────────────────────────────────────
-# 1. Schema 校验：格式错误或多传 approved 字段
-# ─────────────────────────────────────────────
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "arguments, label",
-    [
-        (
-            {
-                "from_account": "bad-account",
-                "to_account": "ACC-A-654321",
-                "amount": 100,
-            },
-            "bad_from_account",
-        ),
-        (
-            {
-                "from_account": "ACC-A-123456",
-                "to_account": "ACC-A-654321",
-                "amount": 100,
-                "approved": True,
-            },
-            "extra_approved_field",
-        ),
-    ],
-)
-async def test_transfer_schema_rejects_extra(arguments, label):
-    runtime, _, audit = build_runtime()
-    ctx = _transfer_context()
-    result = await runtime.invoke(ToolCall("call_schema", "transfer", arguments), ctx)
-
-    # 打印审计日志
-    print_audit_logs(audit, f"- Schema 校验测试 ({label})")
-
-    assert result.code == "INVALID_ARGUMENT", (
-        f"[{label}] 期望 INVALID_ARGUMENT，实际 {result.code}"
+    not_whitelisted = await transfer(
+        runtime,
+        "call_tr_whitelist",
+        arguments,
+        allowed_tools=frozenset({"get_order", "create_refund", "run_shell"}),
+        **approved,
     )
-    assert SIDE_EFFECTS["transfer_executions"] == 0, (
-        f"[{label}] 副作用应为 0，实际 {SIDE_EFFECTS['transfer_executions']}"
+    assert not_whitelisted.code == "TOOL_NOT_ALLOWED"
+
+    plan_mode = await transfer(
+        runtime,
+        "call_tr_plan",
+        arguments,
+        mode=demo.PermissionMode.PLAN,
+        **approved,
     )
+    assert plan_mode.code == "PLAN_MODE_DENIED"
+
+    assert balance(FROM_ACCOUNT) == 100_000.0
 
 
-# ─────────────────────────────────────────────
-# 2. 预检：余额不足
-# ─────────────────────────────────────────────
-@pytest.mark.anyio
-async def test_transfer_precheck_insufficient():
-    """ACC-A-654321 余额 5000，转账 6000 → INSUFFICIENT_BALANCE。"""
-    runtime, _, audit = build_runtime()
-    ctx = _transfer_context()
-    arguments = {
-        "from_account": "ACC-A-654321",
-        "to_account": "ACC-A-123456",
-        "amount": 6000,
-    }
-    result = await runtime.invoke(ToolCall("call_insufficient", "transfer", arguments), ctx)
+@async_test
+async def test_transfer_requires_approval_bound_to_arguments_and_masks_accounts() -> None:
+    """人工审批 + 成功路径 + 结果脱敏 + 审计追踪。"""
 
-    # 打印审计日志
-    print_audit_logs(audit, "- 余额不足预检测试")
+    runtime, approvals, audit = demo.build_runtime()
+    arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 1_200.0}
 
-    assert result.code == "INSUFFICIENT_BALANCE", (
-        f"期望 INSUFFICIENT_BALANCE，实际 {result.code}"
+    pending = await transfer(runtime, "call_tr_000001", arguments)
+    assert pending.ok is False
+    assert pending.action is demo.DecisionAction.CONFIRM
+    assert pending.code == "APPROVAL_REQUIRED"
+    assert balance(FROM_ACCOUNT) == 100_000.0
+
+    approve(approvals, arguments)
+    tampered = await transfer(
+        runtime, "call_tr_000002", {**arguments, "amount": 9_000.0}, approval_id=APPROVAL_ID
     )
-    assert SIDE_EFFECTS["transfer_executions"] == 0, (
-        f"副作用应为 0，实际 {SIDE_EFFECTS['transfer_executions']}"
-    )
+    assert tampered.action is demo.DecisionAction.CONFIRM
+    assert tampered.code == "APPROVAL_REQUIRED"
 
+    executed = await transfer(runtime, "call_tr_000003", arguments, approval_id=APPROVAL_ID)
+    assert executed.ok is True
+    assert executed.action is demo.DecisionAction.ALLOW
+    assert executed.code == "OK"
+    assert executed.content["txn_id"] == "000003"
+    assert executed.content["amount"] == 1_200.0
+    assert executed.content["status"] == "accepted"
+    assert executed.content["from"] == "ACC-A-****3456"
+    assert executed.content["to"] == "ACC-A-****4321"
+    assert balance(FROM_ACCOUNT) == 98_800.0
+    assert balance(TO_ACCOUNT) == 6_200.0
 
-# ─────────────────────────────────────────────
-# 3. 预检：超出单笔限额
-# ─────────────────────────────────────────────
-@pytest.mark.anyio
-async def test_transfer_precheck_exceed_limit():
-    """转账 60000（超 5 万）→ EXCEED_LIMIT。"""
-    runtime, _, audit = build_runtime()
-    ctx = _transfer_context()
-    arguments = {
-        "from_account": "ACC-A-123456",
-        "to_account": "ACC-A-654321",
-        "amount": 60000,
-    }
-    result = await runtime.invoke(ToolCall("call_exceed", "transfer", arguments), ctx)
-
-    # 打印审计日志
-    print_audit_logs(audit, "- 超额预检测试")
-
-    assert result.code == "EXCEED_LIMIT", (
-        f"期望 EXCEED_LIMIT，实际 {result.code}"
-    )
-    assert SIDE_EFFECTS["transfer_executions"] == 0, (
-        f"副作用应为 0，实际 {SIDE_EFFECTS['transfer_executions']}"
-    )
-
-
-# ─────────────────────────────────────────────
-# 4. 审批绑定：审批金额 100，执行时改为 200
-# ─────────────────────────────────────────────
-@pytest.mark.anyio
-async def test_transfer_approval_binding():
-    """审批时金额 100，执行时改为 200 → APPROVAL_REQUIRED（旧审批失效）。"""
-    runtime, approvals, audit = build_runtime()
-    ctx = _transfer_context()
-
-    approved_args = {
-        "from_account": "ACC-A-123456",
-        "to_account": "ACC-A-654321",
-        "amount": 100,
-    }
-    approvals.approve("approval_bind", ctx, "transfer", approved_args)
-
-    # 执行时金额改为 200，digest 不匹配
-    executed_args = {**approved_args, "amount": 200}
-    result = await runtime.invoke(
-        ToolCall("call_binding", "transfer", executed_args),
-        _transfer_context(approval_id="approval_bind"),
-    )
-
-    # 打印审计日志
-    print_audit_logs(audit, "- 审批绑定测试")
-
-    assert result.code == "APPROVAL_REQUIRED", (
-        f"期望 APPROVAL_REQUIRED，实际 {result.code}"
-    )
-    assert SIDE_EFFECTS["transfer_executions"] == 0, (
-        f"副作用应为 0，实际 {SIDE_EFFECTS['transfer_executions']}"
-    )
-
-
-# ─────────────────────────────────────────────
-# 5. 超时不重试：转账 90000 触发超时
-# ─────────────────────────────────────────────
-@pytest.mark.anyio
-async def test_transfer_timeout_no_retry():
-    """转账 90000（>80000 会 sleep 3s，超过 1.5s 超时）→ TIMEOUT_UNKNOWN，transfer_executions <= 1。
-
-    由于默认 precheck 限额为 50000，此处构建一个 precheck 限额为 100000 的
-    自定义 runtime，使 90000 能进入 handler 触发超时。
-    """
-    from tool_governance_demo import (
-        ACCOUNTS,
-        ArgsModel,
-        ExecutionContext,
-        PolicyDenied,
-        TransferArgs,
-        transfer_handler,
-    )
-
-    async def _lenient_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -> None:
-        arguments = raw_arguments
-        assert isinstance(arguments, TransferArgs)
-        # 限额提高到 100000，允许 90000 进入 handler
-        if arguments.amount > 100_000:
-            raise PolicyDenied("EXCEED_LIMIT", "转账金额超过单笔限额")
-        balance = ACCOUNTS.get((context.tenant_id, arguments.from_account), 0.0)
-        if balance < arguments.amount:
-            raise PolicyDenied("INSUFFICIENT_BALANCE", "转出账户余额不足")
-
-    from tool_governance_demo import (
-        Effect,
-        Risk,
-        build_tools,
-    )
-
-    tools = build_tools()
-    # 替换 transfer 工具的 precheck 和 policy（关闭审批要求，使 90000 能进入 handler 触发超时）
-    tools = [
-        ToolDefinition(
-            name=t.name,
-            description=t.description,
-            parameters_model=t.parameters_model,
-            policy=ToolPolicy(
-                effect=t.policy.effect,
-                risk=Risk.MEDIUM,  # 降低风险等级，避免触发审批检查
-                permission=t.policy.permission,
-                requires_approval=False,  # 关闭审批，直接进入 handler
-                timeout_seconds=t.policy.timeout_seconds,
-                max_retries=t.policy.max_retries,
-                idempotent=t.policy.idempotent,
-            ) if t.name == "transfer" else t.policy,
-            handler=t.handler,
-            canonical_target=t.canonical_target,
-            precheck=_lenient_precheck if t.name == "transfer" else t.precheck,
-        )
-        for t in tools
+    assert [(record.phase, record.code) for record in audit.records] == [
+        ("decision", "APPROVAL_REQUIRED"),
+        ("decision", "APPROVAL_REQUIRED"),
+        ("decision", "APPROVED"),
+        ("execution", "OK"),
     ]
 
-    approvals = ApprovalStore()
-    audit = AuditSink()
-    from tool_governance_demo import PermissionEngine
-
-    engine = PermissionEngine((), approvals)
-    runtime = ToolRuntime(tools, engine, audit)
-
-    ctx = _transfer_context()
-    arguments = {
-        "from_account": "ACC-A-123456",
-        "to_account": "ACC-A-888888",
-        "amount": 90000,
-    }
-    result = await runtime.invoke(ToolCall("call_timeout", "transfer", arguments), ctx)
-
-    # 打印审计日志
-    print_audit_logs(audit, "- 超时测试")
-
-    assert result.code == "TIMEOUT_UNKNOWN", (
-        f"期望 TIMEOUT_UNKNOWN，实际 {result.code}"
-    )
-    assert SIDE_EFFECTS["transfer_executions"] <= 1, (
-        f"transfer_executions 应 <= 1，实际 {SIDE_EFFECTS['transfer_executions']}"
-    )
+    replay = await transfer(runtime, "call_tr_000004", arguments, approval_id=APPROVAL_ID)
+    assert replay.action is demo.DecisionAction.CONFIRM
 
 
-# ─────────────────────────────────────────────
-# 6. 额外测试：验证审计日志中的账号脱敏和 CONFIRM 状态
-# ─────────────────────────────────────────────
-@pytest.mark.anyio
-async def test_audit_log_redaction_and_confirm():
-    """验证审计日志中账号已脱敏，且审批流程执行前返回 CONFIRM 状态。"""
-    runtime, _, audit = build_runtime()
-    ctx = _transfer_context()
-    
-    arguments = {
-        "from_account": "ACC-A-123456",
-        "to_account": "ACC-A-654321",
-        "amount": 100,
-    }
-    
-    # 执行转账（没有审批ID，应该触发 CONFIRM）
-    result = await runtime.invoke(
-        ToolCall("call_audit_test", "transfer", arguments),
-        ctx
-    )
-    
-    # 打印审计日志
-    print_audit_logs(audit, "- 审计日志脱敏和CONFIRM状态测试")
-    
-    # 验证决策阶段返回 CONFIRM
-    decision_record = audit.records[0]
-    assert decision_record.phase == "decision", "应该有决策阶段的审计记录"
-    assert decision_record.decision == "confirm", (
-        f"期望 decision 为 confirm，实际 {decision_record.decision}"
-    )
-    assert decision_record.code == "APPROVAL_REQUIRED", (
-        f"期望 code 为 APPROVAL_REQUIRED，实际 {decision_record.code}"
-    )
-    
-    # 验证审计日志中包含脱敏后的参数
-    assert decision_record.redacted_arguments is not None, "审计记录应包含脱敏后的参数"
-    redacted = decision_record.redacted_arguments
-    
-    # 验证账号已脱敏
-    assert redacted["from_account"] == "ACC-A-****3456", (
-        f"from_account 应脱敏为 ACC-A-****3456，实际 {redacted['from_account']}"
-    )
-    assert redacted["to_account"] == "ACC-A-****4321", (
-        f"to_account 应脱敏为 ACC-A-****4321，实际 {redacted['to_account']}"
-    )
-    assert redacted["amount"] == 100, "金额不应被脱敏"
-    
-    # 验证没有执行（因为返回了 CONFIRM）
-    assert result.action == "confirm", f"期望 action 为 confirm，实际 {result.action}"
-    assert SIDE_EFFECTS["transfer_executions"] == 0, (
-        f"CONFIRM 状态下不应执行，实际执行次数 {SIDE_EFFECTS['transfer_executions']}"
-    )
+@async_test
+async def test_transfer_timeout_is_reported_as_unknown_and_leaves_balances_untouched() -> None:
+    """超时处理：非幂等写超时是 TIMEOUT_UNKNOWN，且超时点必须早于扣款。"""
+
+    runtime, approvals, audit = demo.build_runtime()
+    # 50000 是 precheck 的边界（spec 是 amount > 50000 才拒绝），也是限额内最大的合法金额：
+    # 只要慢调用阈值严格小于 50000，这笔一定会进入 sleep(3.0) 分支。
+    arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 50_000.0}
+    approve(approvals, arguments)
+
+    started = time.perf_counter()
+    result = await transfer(runtime, "call_tr_timeout", arguments, approval_id=APPROVAL_ID)
+    elapsed = time.perf_counter() - started
+
+    assert result.ok is False
+    assert result.code == "TIMEOUT_UNKNOWN"
+    assert elapsed < SLEEP_SECONDS
+    assert balance(FROM_ACCOUNT) == 100_000.0
+    assert balance(TO_ACCOUNT) == 5_000.0
+    assert audit.records[-1].phase == "execution"
+    assert audit.records[-1].code == "TIMEOUT_UNKNOWN"
