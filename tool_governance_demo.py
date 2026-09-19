@@ -1,3 +1,30 @@
+      
+"""第二章实战作业：为治理框架增加“转账”工具（练习版，不含答案）。
+
+这是 `tool_governance_demo.py` 的填空题版本：治理框架本身（Pydantic 校验 →
+权限状态机 → 一次性审批 → 超时恢复 → 结果脱敏 → 审计追踪）已经完整可运行，
+你要做的是把 `transfer` 工具接进去，让这整条链路真正跑一遍。
+
+搜索 `TODO(任务` 可以定位全部待补位置：
+
+    任务 1  新建 ACCOUNTS 模拟账户数据
+    任务 2  定义 TransferArgs 参数模型
+    任务 3  实现 transfer_precheck 业务预检
+    任务 4  实现 transfer_handler 转账处理
+    任务 5  在 build_tools() 里注册 transfer 工具
+    任务 6  在 _redact 里追加账号脱敏
+
+验收命令：
+
+    python -m pytest tests/test_tool_governance.py -v -k "transfer"
+
+不能改动的地方：
+
+    1. PermissionEngine.decide 里一行都不要动，它的优先级顺序是固定框架。
+    2. 测试里不要绕过 ToolRuntime.invoke，所有调用必须走 runtime.invoke()。
+    3. 不要删除 TransferArgs 的 extra="forbid"（继承自 StrictArgs，是防注入的最后屏障）。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -16,8 +43,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 class PermissionMode(StrEnum):
-    """定义运行时权限模式，控制工具调用是否需要确认或限制副作用。"""
-
     DEFAULT = "default"
     PLAN = "plan"
     BYPASS_PERMISSIONS = "bypassPermissions"
@@ -25,24 +50,18 @@ class PermissionMode(StrEnum):
 
 
 class Effect(StrEnum):
-    """描述工具执行可能产生的副作用类型。"""
-
     READ = "read"
     WRITE = "write"
     SHELL = "shell"
 
 
 class Risk(StrEnum):
-    """标记工具或业务动作的风险等级。"""
-
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
 
 
 class DecisionAction(StrEnum):
-    """表示权限引擎对一次工具调用给出的最终动作。"""
-
     ALLOW = "allow"
     DENY = "deny"
     CONFIRM = "confirm"
@@ -53,8 +72,6 @@ Permission = Literal["order:read", "refund:create", "shell:run", "transfer:execu
 
 @dataclass(frozen=True, slots=True)
 class ExecutionContext:
-    """承载一次执行所需的身份、租户、权限和审批上下文。"""
-
     trace_id: str
     user_id: str
     tenant_id: str
@@ -66,8 +83,6 @@ class ExecutionContext:
 
 @dataclass(frozen=True, slots=True)
 class ToolPolicy:
-    """声明单个工具的副作用、风险、业务权限与执行约束。"""
-
     effect: Effect
     risk: Risk
     permission: Permission
@@ -84,30 +99,30 @@ class StrictArgs(BaseModel):
 
 
 class GetOrderArgs(StrictArgs):
-    """查询订单工具的参数 Schema。"""
-
     order_id: str = Field(pattern=r"^ord_[0-9]{4}$")
 
 
 class CreateRefundArgs(StrictArgs):
-    """创建退款工具的参数 Schema。"""
-
     order_id: str = Field(pattern=r"^ord_[0-9]{4}$")
     amount: float = Field(gt=0, le=10_000)
     reason: str = Field(min_length=4, max_length=200)
 
 
 class RunShellArgs(StrictArgs):
-    """模拟 Shell 工具的参数 Schema。"""
-
     command: str = Field(min_length=1, max_length=200)
 
-class TransferArgs(StrictArgs):
-    from_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
-    to_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
-    amount: float = Field(gt=0, le=100000)
 
-ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs
+# ===== TODO(任务 2)：定义转账参数模型 =====
+# 新建 TransferArgs 类，继承 StrictArgs，三个字段：
+#   from_account: str   正则约束 ^ACC-[A-Z]-[0-9]{6}$
+#   to_account:   str   正则约束同上
+#   amount:       float gt=0 且 le=100_000
+# 参考上面的 CreateRefundArgs 怎么写 Field 约束。
+class TransferArgs(StrictArgs):
+    """TODO(任务 2)：补全 from_account / to_account / amount 三个字段。"""
+
+
+ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs | TransferArgs
 Handler = Callable[[str, ArgsModel, ExecutionContext], Awaitable[Mapping[str, Any]]]
 Precheck = Callable[[ArgsModel, ExecutionContext], Awaitable[None]]
 CanonicalTarget = Callable[[ArgsModel], str]
@@ -115,8 +130,6 @@ CanonicalTarget = Callable[[ArgsModel], str]
 
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
-    """聚合模型可见定义、治理策略、执行函数与业务预检。"""
-
     name: str
     description: str
     parameters_model: type[StrictArgs]
@@ -140,8 +153,6 @@ class ToolDefinition:
 
 @dataclass(frozen=True, slots=True)
 class PermissionRule:
-    """配置针对工具名和目标前缀的 allow / deny 规则。"""
-
     effect: Literal["allow", "deny"]
     tool_name: str
     target_prefix: str | None = None
@@ -149,8 +160,6 @@ class PermissionRule:
 
 @dataclass(frozen=True, slots=True)
 class PermissionDecision:
-    """记录权限状态机的动作、原因码、说明和决策来源。"""
-
     action: DecisionAction
     code: str
     reason: str
@@ -161,8 +170,6 @@ class PermissionDecision:
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
-    """表示模型或调用方提交的一次原始工具调用。"""
-
     tool_call_id: str
     name: str
     arguments: Mapping[str, Any]
@@ -170,8 +177,6 @@ class ToolCall:
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
-    """封装工具执行结果，并负责投影成模型可消费的 tool 消息。"""
-
     tool_call_id: str
     tool_name: str
     ok: bool
@@ -198,8 +203,6 @@ class ToolResult:
 
 @dataclass(frozen=True, slots=True)
 class AuditRecord:
-    """记录工具调用在决策或执行阶段产生的审计事件。"""
-
     trace_id: str
     tool_call_id: str
     tool_name: str
@@ -210,13 +213,10 @@ class AuditRecord:
     code: str
     argument_keys: tuple[str, ...]
     latency_ms: int | None = None
-    redacted_arguments: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
 class ApprovalRecord:
-    """保存一次参数绑定、租户绑定且可一次性消费的审批凭证。"""
-
     approval_id: str
     user_id: str
     tenant_id: str
@@ -227,16 +227,12 @@ class ApprovalRecord:
 
 
 class PolicyDenied(RuntimeError):
-    """表示业务规则或权限检查主动拒绝本次调用。"""
-
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
 
 
 class TransientToolError(RuntimeError):
-    """表示可重试的临时性工具错误。"""
-
     pass
 
 
@@ -256,8 +252,6 @@ def _approval_digest(tool_name: str, arguments: ArgsModel | Mapping[str, Any]) -
 
 
 class ApprovalStore:
-    """以内存方式管理审批记录的创建、校验和一次性消费。"""
-
     def __init__(self) -> None:
         self._records: dict[str, ApprovalRecord] = {}
 
@@ -302,8 +296,6 @@ class ApprovalStore:
 
 
 class AuditSink:
-    """收集权限决策和工具执行阶段的审计记录。"""
-
     def __init__(self) -> None:
         self.records: list[AuditRecord] = []
 
@@ -335,14 +327,11 @@ def _redact(value: Any) -> Any:
         return [_redact(item) for item in value]
     if isinstance(value, str):
         value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "***@***", value)
-        value = re.sub(r"(ACC-[A-Z]-)\d{2}(\d{4})", r"\1****\2", value)
+        # ===== TODO(任务 6)：在这里追加账号脱敏 =====
+        # 把 ACC-A-123456 变成 ACC-A-****3456（保留字符前缀与末 4 位）。
+        # 提示：re.sub 的替换既可以是字符串，也可以是函数，两种都行。
         return value
     return value
-
-
-def _redact_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """对参数字典进行脱敏处理，用于审计日志记录。"""
-    return _redact(dict(arguments))
 
 
 class PermissionEngine:
@@ -522,7 +511,6 @@ class ToolRuntime:
                 decision=decision.action,
                 code=decision.code,
                 argument_keys=tuple(sorted(call.arguments)),
-                redacted_arguments=_redact_arguments(call.arguments),
             )
         )
         if decision.action is not DecisionAction.ALLOW:
@@ -561,7 +549,6 @@ class ToolRuntime:
                 code="OK",
                 argument_keys=tuple(sorted(call.arguments)),
                 latency_ms=latency_ms,
-                redacted_arguments=_redact_arguments(call.arguments),
             )
         )
         return ToolResult(call.tool_call_id, call.name, True, DecisionAction.ALLOW, "OK", safe_content)
@@ -638,17 +625,20 @@ ORDERS = {
         "customer_email": "alice@example.com",
     }
 }
-ACCOUNTS = {
-    ("tenant_a", "ACC-A-123456"): 100000.0,
-    ("tenant_a", "ACC-A-654321"): 5000.0,
-    ("tenant_a", "ACC-A-888888"): 20000.0,
-    ("tenant_b", "ACC-A-111111"): 50000.0
-}
-SIDE_EFFECTS = {"refund_executions": 0, "shell_executions": 0, "transfer_executions": 0}
+# ===== TODO(任务 1)：新增模拟账户数据 =====
+# 在 ORDERS 后面新建 ACCOUNTS：Key 为 (tenant_id, account_id)，Value 为余额（float）。
+# 预设数据（来自作业任务 1）：
+#   ("tenant_a", "ACC-A-123456"): 100_000.0
+#   ("tenant_a", "ACC-A-654321"): 5_000.0
+#   ("tenant_a", "ACC-A-888888"): 20_000.0
+#   ("tenant_b", "ACC-B-111111"): 50_000.0
+# 注意：ACCOUNTS 是模块级可变状态，测试会按用例快照还原，所以必须写成可变的 dict。
+ACCOUNTS: dict[tuple[str, str], float] = {}
+SIDE_EFFECTS = {"refund_executions": 0, "shell_executions": 0}
 
 
 def reset_side_effects() -> None:
-    SIDE_EFFECTS.update(refund_executions=0, shell_executions=0, transfer_executions=0)
+    SIDE_EFFECTS.update(refund_executions=0, shell_executions=0)
 
 
 async def get_order_handler(
@@ -674,39 +664,16 @@ async def refund_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -
         raise PolicyDenied("BUSINESS_RULE_DENIED", "退款金额超过可退金额")
 
 
+# ===== TODO(任务 3)：实现业务预检 =====
+# 异步函数 transfer_precheck(args, context)：只做判断，不改余额，
+# 按下面的顺序检查，不满足就 raise PolicyDenied（参考上面的 refund_precheck）：
+#   1. 金额落进教学拦截区间 50000 < amount <= 80000 → PolicyDenied("EXCEED_LIMIT", ...)
+#      这是教学专用规则，不是真实单笔限额：amount > 80000 的调用必须能过预检，
+#      留给任务 4 的超时分支使用。
+#   2. 从 ACCOUNTS 查 (context.tenant_id, from_account) 的余额，小于 amount
+#      → PolicyDenied("INSUFFICIENT_BALANCE", ...)
 async def transfer_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -> None:
-    arguments = raw_arguments
-    assert isinstance(arguments, TransferArgs)
-    if arguments.amount > 50_000:
-        raise PolicyDenied("EXCEED_LIMIT", "转账金额超过单笔限额")
-    balance = ACCOUNTS.get((context.tenant_id, arguments.from_account), 0.0)
-    if balance < arguments.amount:
-        raise PolicyDenied("INSUFFICIENT_BALANCE", "转出账户余额不足")
-
-
-async def transfer_handler(
-    tool_call_id: str,
-    raw_arguments: ArgsModel,
-    context: ExecutionContext,
-) -> Mapping[str, Any]:
-    arguments = raw_arguments
-    assert isinstance(arguments, TransferArgs)
-    SIDE_EFFECTS["transfer_executions"] += 1
-    if arguments.amount > 80_000:
-        await asyncio.sleep(3.0)
-    to_key = (context.tenant_id, arguments.to_account)
-    if to_key not in ACCOUNTS:
-        raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")
-    from_key = (context.tenant_id, arguments.from_account)
-    ACCOUNTS[from_key] = ACCOUNTS.get(from_key, 0.0) - arguments.amount
-    ACCOUNTS[to_key] = ACCOUNTS[to_key] + arguments.amount
-    return {
-        "txn_id": tool_call_id[-6:],
-        "from": arguments.from_account,
-        "to": arguments.to_account,
-        "amount": arguments.amount,
-        "status": "completed",
-    }
+    raise NotImplementedError("TODO(任务 3)：请实现 transfer_precheck")
 
 
 async def create_refund_handler(
@@ -725,6 +692,22 @@ async def create_refund_handler(
         "amount": arguments.amount,
         "status": "accepted",
     }
+
+
+# ===== TODO(任务 4)：实现转账处理函数 =====
+# 异步函数 transfer_handler(tool_call_id, args, context)（参考上面的 create_refund_handler）：
+#   1. 超时模拟：amount > 80000 时先 await asyncio.sleep(3.0)，并且这一句必须在扣款之前，
+#      让框架的 asyncio.timeout 先掐断执行。
+#   2. 转入账户不存在 → raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")，
+#      即 (context.tenant_id, to_account) 不在 ACCOUNTS 里就报错。
+#   3. 改余额：转出账户扣 amount，转入账户加 amount。
+#   4. 返回 dict：txn_id（tool_call_id 后 6 位）、from、to、amount、status="accepted"。
+async def transfer_handler(
+    tool_call_id: str,
+    raw_arguments: ArgsModel,
+    context: ExecutionContext,
+) -> Mapping[str, Any]:
+    raise NotImplementedError("TODO(任务 4)：请实现 transfer_handler")
 
 
 async def simulated_shell_handler(
@@ -769,15 +752,15 @@ def build_tools() -> list[ToolDefinition]:
             handler=simulated_shell_handler,
             canonical_target=lambda args: str(getattr(args, "command")),
         ),
-        ToolDefinition(
-            name="transfer",
-            description="为当前租户的账户执行转账操作",
-            parameters_model=TransferArgs,
-            policy=ToolPolicy(Effect.WRITE, Risk.HIGH, "transfer:execute", True, 1.5, 0, False),
-            handler=transfer_handler,
-            precheck=transfer_precheck,
-            canonical_target=lambda args: f"{args.from_account}->{args.to_account}"
-        )
+        # ===== TODO(任务 5)：在这里注册 transfer 工具 =====
+        # 在 return 列表末尾追加一个 ToolDefinition，参考上面的 create_refund：
+        #   name="transfer"，description 自拟
+        #   parameters_model=TransferArgs
+        #   handler=transfer_handler，precheck=transfer_precheck
+        #   canonical_target 要能区分不同参数组合（审批摘要用它做参数绑定）
+        #   policy 参考同类写操作工具：Effect.WRITE、应当需要人工审批、
+        #   permission 用 "transfer:execute"、非幂等、max_retries=0；
+        #   timeout_seconds 必须小于任务 4 里超时演示的 3 秒。
     ]
 
 
@@ -951,3 +934,5 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     cli_args = parse_args()
     asyncio.run(run_deepseek_agent(cli_args.input) if cli_args.agent else run_offline_demo())
+
+    
